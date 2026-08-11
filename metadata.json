@@ -1,0 +1,6 @@
+{
+  "name": "Logistics Gate Portal",
+  "description": "Automated government portal scraper and gate entries dashboard for truck logistics",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,75 @@
+version: '3.8'
+
+services:
+  # -------------------------------------------------------------------
+  # 1. PostgreSQL 15 Database Service
+  # Stores truck gate entry records and scraper execution logs
+  # -------------------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: opms_postgres
+    restart: always
+    environment:
+      POSTGRES_DB: ${DB_NAME:-truck_gate_db}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres_password_123}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-truck_gate_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------------------------------------------------
+  # 2. Python Playwright Scraper Service
+  # Connects to OPMS portal, solves 2Captcha, parses gate table, saves to DB
+  # -------------------------------------------------------------------
+  scraper:
+    build:
+      context: ./scraper
+      dockerfile: Dockerfile
+    container_name: opms_scraper
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-truck_gate_db}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres_password_123}
+      OPMS_USERNAME: ${OPMS_USERNAME:-admin_gate}
+      OPMS_PASSWORD: ${OPMS_PASSWORD:-SecretPass123!}
+      CAPTCHA_KEY: ${CAPTCHA_KEY:-2captcha_api_key_here}
+      SCRAPE_INTERVAL_MINUTES: 15
+      PORTAL_URL: ${PORTAL_URL:-https://opms.gov.example/login}
+
+  # -------------------------------------------------------------------
+  # 3. Node.js Express REST API & Dashboard Service
+  # Queries PostgreSQL database and exposes /api/trucks endpoints
+  # -------------------------------------------------------------------
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: opms_api
+    restart: always
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: 3000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-truck_gate_db}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres_password_123}
+
+volumes:
+  pgdata:
