@@ -1,38 +1,22 @@
-FROM python:3.11-slim
+# Use a Debian-based slim image (Crucial for Playwright dependencies)
+FROM python:3.11-slim-bookworm
 
-# Install system packages required by Playwright headless browser
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget \
-    gnupg \
-    curl \
-    libglib2.0-0 \
-    libnss3 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libdrm2 \
-    libxkbcommon0 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxfixes3 \
-    libxrandr2 \
-    libgbm1 \
-    libpango-1.0-0 \
-    libcairo2 \
-    libasound2 \
-    && rm -rf /var/lib/apt/lists/*
-
+# Set the working directory
 WORKDIR /app
 
-# Copy requirement specifications and install python packages
+# Update package lists so Playwright can find the dependencies it needs
+RUN apt-get update && apt-get install -y wget gnupg
+
+# Copy requirements and install Python packages
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browser binaries (Chromium)
+# Install Playwright and its specific system dependencies for Chromium
 RUN playwright install chromium
 RUN playwright install-deps chromium
 
-# Copy Python scraper script
-COPY main.py .
+# Copy the rest of your scraper code
+COPY . .
 
-CMD ["python", "-u", "main.py"]
+# Run the Python script
+CMD ["python", "main.py"]
