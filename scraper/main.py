@@ -3,6 +3,7 @@ import time
 import io
 import json
 import logging
+import random
 import psycopg2
 from psycopg2.extras import execute_values
 from playwright.sync_api import sync_playwright
@@ -181,11 +182,14 @@ def run_scrape_cycle():
         return
 
     with sync_playwright() as p:
-        # Standard Proxy Mode without the session parameter to prevent 502 errors
+        # Generate a random integer ID (0 to 1,000,000) to lock the residential IP address 
+        session_id = random.randint(1, 999999)
+        
         scrape_do_proxy = {
             "server": "http://proxy.scrape.do:8080",
             "username": SCRAPEDO_TOKEN,
-            "password": "geoCode=in&super=true"
+            # We enforce geoCode=in (India), super=true (Residential IP), render=false (Since Playwright handles JS), and lock the sessionId
+            "password": f"geoCode=in&super=true&render=false&sessionId={session_id}"
         }
 
         browser = p.chromium.launch(
@@ -256,19 +260,15 @@ def run_scrape_cycle():
             logger.info("Navigating to Gate Entry page...")
             page.goto(GATE_ENTRY_URL, timeout=90000)
             
-            # Use broad, standard HTML selectors to avoid strict CSS class mismatches
             table_selector = "table"
             row_selector = "table tbody tr"
             
             try:
                 page.wait_for_load_state('networkidle', timeout=30000)
-                # Wait for any table rows to attach to the DOM (removes strict visibility checks)
                 page.wait_for_selector(row_selector, state="attached", timeout=45000)
-                # Give JavaScript 2 seconds to finish injecting the text into the rows
                 page.wait_for_timeout(2000) 
             except Exception as e:
                 logger.error("Timeout: Could not find table rows.")
-                # --- X-RAY DEBUGGING ---
                 logger.error(f"DEBUG URL: {page.url}")
                 logger.error(f"DEBUG TITLE: {page.title()}")
                 try:
@@ -283,16 +283,13 @@ def run_scrape_cycle():
 
             # 3. Handle Table Screenshots & Pagination
             while True:
-                # Capture screenshot of the first table element found on the page
                 table_element = page.locator(table_selector).first
                 screenshot_bytes = table_element.screenshot()
 
-                # Extract visual table data using Gemini Vision API
                 records = extract_table_data_via_gemini(screenshot_bytes)
                 if records:
                     all_records.extend(records)
 
-                # Check for 'Next' button to handle multiple pages of table records
                 next_btn = page.query_selector("li.paginate_button.next:not(.disabled) a")
                 if next_btn:
                     logger.info("Clicking Next page...")
