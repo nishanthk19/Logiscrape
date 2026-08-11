@@ -13,10 +13,10 @@ services:
       POSTGRES_DB: ${DB_NAME:-truck_gate_db}
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres_password_123}
-    ports:
-      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    networks:
+      - opms_net
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-truck_gate_db}"]
       interval: 10s
@@ -25,7 +25,7 @@ services:
 
   # -------------------------------------------------------------------
   # 2. Python Playwright Scraper Service
-  # Connects to OPMS portal, solves 2Captcha, parses gate table, saves to DB
+  # Connects to OPMS portal, solves CAPTCHA via Gemini, parses table, saves to DB
   # -------------------------------------------------------------------
   scraper:
     build:
@@ -36,17 +36,19 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - opms_net
     environment:
       DB_HOST: postgres
       DB_PORT: 5432
       DB_NAME: ${DB_NAME:-truck_gate_db}
       DB_USER: ${DB_USER:-postgres}
       DB_PASSWORD: ${DB_PASSWORD:-postgres_password_123}
-      OPMS_USERNAME: ${OPMS_USERNAME:-admin_gate}
-      OPMS_PASSWORD: ${OPMS_PASSWORD:-SecretPass123!}
-      CAPTCHA_KEY: ${CAPTCHA_KEY:-2captcha_api_key_here}
+      OPMS_USERNAME: ${OPMS_USERNAME}
+      OPMS_PASSWORD: ${OPMS_PASSWORD}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
       SCRAPE_INTERVAL_MINUTES: 15
-      PORTAL_URL: ${PORTAL_URL:-https://opms.gov.example/login}
+      PORTAL_URL: ${PORTAL_URL:-https://ppscmr.telangana.gov.in/}
 
   # -------------------------------------------------------------------
   # 3. Node.js Express REST API & Dashboard Service
@@ -63,6 +65,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - opms_net
     environment:
       PORT: 3000
       DB_HOST: postgres
@@ -73,3 +77,7 @@ services:
 
 volumes:
   pgdata:
+
+networks:
+  opms_net:
+    driver: bridge
