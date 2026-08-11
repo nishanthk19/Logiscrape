@@ -191,7 +191,8 @@ def run_scrape_cycle():
             scrape_do_proxy = {
                 "server": "http://proxy.scrape.do:8080",
                 "username": SCRAPEDO_TOKEN,
-                "password": f"geoCode=in&super=true&sessionId={session_id}" 
+                # Removed super=true to use stable, high-speed Indian proxy nodes
+                "password": f"geoCode=in&sessionId={session_id}"
             }
 
             browser = p.chromium.launch(
