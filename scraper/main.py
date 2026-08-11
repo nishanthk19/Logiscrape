@@ -2,6 +2,7 @@ import os
 import time
 import re
 import io
+import json
 import logging
 import psycopg2
 from psycopg2.extras import execute_values
@@ -32,15 +33,6 @@ else:
     gemini_client = None
 
 # --- Helper Functions ---
-def parse_waybill(waybill_raw):
-    """Parses format like '(AP12V7631 : 122511178095 : 07-08-2026)'"""
-    if not waybill_raw:
-        return None, None, None
-    match = re.search(r'\((.*?)\s*:\s*(.*?)\s*:\s*(.*?)\)', waybill_raw)
-    if match:
-        return match.group(1).strip(), match.group(2).strip(), match.group(3).strip()
-    return None, None, None
-
 def get_captcha_bytes(page):
     """Waits for the CAPTCHA element and captures valid image bytes."""
     selectors = ["img[src*='Captcha' i]", "img[src*='captcha' i]", "#captchaImage", "#captcha_img", ".captcha-image"]
@@ -56,17 +48,70 @@ def get_captcha_bytes(page):
     return None
 
 def solve_captcha_with_gemini(captcha_bytes):
-    """Solves the captured image using Google Gemini."""
+    """Solves the login CAPTCHA image using Gemini."""
     if not captcha_bytes or not gemini_client:
         return None
     try:
         image = Image.open(io.BytesIO(captcha_bytes))
         prompt = "Return ONLY the exact characters or numbers shown in this CAPTCHA image. Do not include spaces or extra text."
         response = gemini_client.models.generate_content(model='gemini-1.5-flash', contents=[prompt, image])
-        return response.text.strip().replace(" ", "")
+        captcha_text = response.text.strip().replace(" ", "")
+        logger.info(f"Gemini solved CAPTCHA: {captcha_text}")
+        return captcha_text
     except Exception as e:
         logger.error(f"Gemini CAPTCHA solve error: {e}")
         return None
+
+def extract_table_data_via_gemini(screenshot_bytes):
+    """Uses Gemini Vision API to convert a table screenshot directly into JSON records."""
+    if not screenshot_bytes or not gemini_client:
+        return []
+    
+    try:
+        logger.info("Sending table screenshot to Gemini Vision for structured JSON extraction...")
+        image = Image.open(io.BytesIO(screenshot_bytes))
+        
+        prompt = """
+        Analyze this screenshot of the gate entry table. Extract all table rows into a valid JSON array of objects.
+        
+        For each row, extract the following fields strictly into these exact JSON keys:
+        - "season": Season string (e.g., "Rabi 25-26", "Kharif 25-26")
+        - "mill_name": Full Mill Name
+        - "miller_dispatch_date": Date string (e.g., "07-08-2026")
+        - "consignment_number": Consignment Number string
+        - "ack_number": Ack. No string
+        - "class_type": Class type string
+        - "total_bags": Numeric total bags (e.g., 580)
+        - "total_quantity": Numeric total quantity (e.g., 290)
+        - "vehicle_number": Extract vehicle registration code from Way Bill Details (e.g., "AP12V7631")
+        - "waybill_number": Extract waybill ID digits from Way Bill Details (e.g., "122511178095")
+        - "waybill_date": Extract date from Way Bill Details (e.g., "07-08-2026")
+        - "gate_status": Status button text ("Gate In" or "Gate Out")
+
+        Return ONLY a raw JSON array. Do not include markdown code formatting, backticks, or explanatory text.
+        """
+        
+        response = gemini_client.models.generate_content(
+            model='gemini-1.5-flash',
+            contents=[prompt, image]
+        )
+        
+        raw_text = response.text.strip()
+        # Strip markdown formatting block if present
+        if raw_text.startswith("```"):
+            lines = raw_text.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            raw_text = "\n".join(lines).strip()
+
+        records = json.loads(raw_text)
+        logger.info(f"Gemini Vision successfully extracted {len(records)} rows from screenshot.")
+        return records
+    except Exception as e:
+        logger.error(f"Gemini Vision table extraction error: {e}")
+        return []
 
 def save_to_database(records):
     """Saves records to PostgreSQL using Upsert."""
@@ -92,14 +137,29 @@ def save_to_database(records):
             ON CONFLICT (consignment_number) DO UPDATE SET 
                 gate_status = EXCLUDED.gate_status, last_updated_at = CURRENT_TIMESTAMP;
         """
-        values = [[
-            r['consignment_number'], r['ack_number'], r['season'], r['mill_name'], r['miller_dispatch_date'],
-            r['class_type'], r['total_bags'], r['total_quantity'], r['vehicle_number'], r['waybill_number'], 
-            r['waybill_date'], r['gate_status']
-        ] for r in records]
-        execute_values(cursor, insert_query, values)
-        conn.commit()
-        logger.info(f"Saved {len(records)} entries to PostgreSQL.")
+        values = []
+        for r in records:
+            consignment = r.get('consignment_number')
+            if consignment:
+                values.append([
+                    str(consignment),
+                    str(r.get('ack_number', '')),
+                    str(r.get('season', '')),
+                    str(r.get('mill_name', '')),
+                    str(r.get('miller_dispatch_date', '')),
+                    str(r.get('class_type', '')),
+                    float(r.get('total_bags', 0)) if str(r.get('total_bags', '')).replace('.', '', 1).isdigit() else 0.0,
+                    float(r.get('total_quantity', 0)) if str(r.get('total_quantity', '')).replace('.', '', 1).isdigit() else 0.0,
+                    str(r.get('vehicle_number', '')),
+                    str(r.get('waybill_number', '')),
+                    str(r.get('waybill_date', '')),
+                    str(r.get('gate_status', ''))
+                ])
+
+        if values:
+            execute_values(cursor, insert_query, values)
+            conn.commit()
+            logger.info(f"Saved {len(values)} entries to PostgreSQL.")
     except Exception as e:
         logger.error(f"Database error: {e}")
     finally:
@@ -115,132 +175,7 @@ def run_scrape_cycle():
         return
 
     with sync_playwright() as p:
-        # Route through Scrape.do Indian Residential Proxies
         scrape_do_proxy = {
-            "server": "http://proxy.scrape.do:8080",
+            "server": "[http://proxy.scrape.do:8080](http://proxy.scrape.do:8080)",
             "username": SCRAPEDO_TOKEN,
-            "password": "geoCode=in&super=true"
-        }
-
-        browser = p.chromium.launch(
-            headless=True, 
-            proxy=scrape_do_proxy,
-            args=[
-                '--no-sandbox', 
-                '--disable-setuid-sandbox', 
-                '--disable-blink-features=AutomationControlled',
-                '--ignore-certificate-errors'  # Ignores SSL authority errors at browser level
-            ]
-        )
-        
-        context = browser.new_context(
-            ignore_https_errors=True,  # Ignores SSL authority errors at context level
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={'width': 1920, 'height': 1080},
-            extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9",
-                "Upgrade-Insecure-Requests": "1"
-            }
-        )
-        page = context.new_page()
-
-        try:
-            # 1. Login Logic
-            login_success = False
-            for attempt in range(3):
-                logger.info(f"Login attempt {attempt + 1}/3")
-                page.goto(LOGIN_URL, timeout=60000)
-                page.wait_for_load_state('networkidle', timeout=60000)
-                
-                if "Login" not in page.title():
-                    login_success = True
-                    break
-
-                captcha_bytes = get_captcha_bytes(page)
-                captcha_text = solve_captcha_with_gemini(captcha_bytes)
-                
-                if not captcha_text:
-                    time.sleep(2)
-                    continue
-
-                page.fill("input[type='text'], #Username", OPMS_USERNAME) 
-                page.fill("input[type='password'], #Password", OPMS_PASSWORD)
-                
-                captcha_input = page.query_selector("input[id*='captcha' i]")
-                if captcha_input: 
-                    captcha_input.fill(captcha_text)
-                
-                submit_btn = page.query_selector("button[type='submit'], #btnLogin")
-                if submit_btn: 
-                    submit_btn.click()
-                
-                page.wait_for_load_state('networkidle', timeout=60000)
-                
-                if "Login" not in page.title() or page.url != LOGIN_URL:
-                    logger.info("Login successful!")
-                    login_success = True
-                    break
-
-            if not login_success:
-                logger.error("Failed to login after 3 attempts.")
-                browser.close()
-                return
-
-            # 2. Navigate to Gate Entry
-            logger.info("Navigating to Gate Entry page...")
-            page.goto(GATE_ENTRY_URL, timeout=90000)
-            
-            row_selector = "table.opms_table tbody tr"
-            try:
-                page.wait_for_load_state('networkidle', timeout=30000)
-                page.wait_for_selector(row_selector, state="visible", timeout=60000)
-            except Exception as e:
-                logger.error(f"Timeout: Could not find the table using selector '{row_selector}'. URL: {page.url} Title: {page.title()}")
-                browser.close()
-                return
-
-            all_records = []
-            
-            # 3. Extract Data & Handle Pagination
-            while True:
-                rows = page.query_selector_all(row_selector)
-                for row in rows:
-                    cols = [c.inner_text().strip() for c in row.query_selector_all("td")]
-                    if len(cols) >= 11:
-                        veh_no, waybill_no, waybill_date = parse_waybill(cols[9])
-                        record = {
-                            "season": cols[1], "mill_name": cols[2], "miller_dispatch_date": cols[3],
-                            "consignment_number": cols[4], "ack_number": cols[5], "class_type": cols[6],
-                            "total_bags": float(cols[7]) if cols[7].replace('.','',1).isdigit() else 0.0,
-                            "total_quantity": float(cols[8]) if cols[8].replace('.','',1).isdigit() else 0.0,
-                            "vehicle_number": veh_no, "waybill_number": waybill_no, "waybill_date": waybill_date,
-                            "gate_status": cols[10].replace("\n", "").strip() 
-                        }
-                        all_records.append(record)
-
-                next_btn = page.query_selector("li.paginate_button.next:not(.disabled) a")
-                if next_btn:
-                    next_btn.click()
-                    page.wait_for_timeout(2000)
-                    page.wait_for_selector(row_selector, state="visible", timeout=15000)
-                else:
-                    break
-
-            # 4. Save to Database
-            if all_records:
-                save_to_database(all_records)
-                logger.info(f"Scrape cycle finished successfully. Processed {len(all_records)} records.")
-            else:
-                logger.warning("No records found in table.")
-
-        except Exception as e:
-            logger.error(f"Error during scrape cycle: {e}")
-        finally:
-            browser.close()
-
-if __name__ == "__main__":
-    logger.info("Starting OPMS Scraper Service with Scrape.do Proxy...")
-    while True:
-        run_scrape_cycle()
-        logger.info(f"Sleeping for {SCRAPE_INTERVAL // 60} minutes until next scheduled run...")
-        time.sleep(SCRAPE_INTERVAL)
+            "password": "geoCode=in
