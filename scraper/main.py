@@ -5,7 +5,6 @@ import io
 import logging
 import psycopg2
 from psycopg2.extras import execute_values
-from datetime import datetime
 from playwright.sync_api import sync_playwright
 import google.generativeai as genai
 from PIL import Image
@@ -40,7 +39,6 @@ def parse_waybill(waybill_raw):
 
 def get_captcha_bytes(page):
     """Waits for the CAPTCHA element and captures valid image bytes."""
-    # List of common selectors to try (case-insensitive)
     selectors = [
         "img[src*='Captcha' i]", 
         "img[src*='captcha' i]", 
@@ -52,13 +50,11 @@ def get_captcha_bytes(page):
     
     for selector in selectors:
         try:
-            # Short timeout per selector to fail fast
             element = page.wait_for_selector(selector, state="visible", timeout=3000)
             if element:
                 logger.info(f"CAPTCHA image found using selector: {selector}")
                 image_bytes = element.screenshot()
                 
-                # Verify bytes are not empty
                 if image_bytes and len(image_bytes) > 0:
                     return image_bytes
         except Exception:
@@ -78,7 +74,6 @@ def solve_captcha_with_gemini(captcha_bytes):
         prompt = "Return ONLY the exact characters or numbers shown in this CAPTCHA image. Do not include spaces, quotes, punctuation, or extra text."
         
         response = model.generate_content([prompt, image])
-        # Clean the response to ensure no whitespace is included
         captcha_text = response.text.strip().replace(" ", "")
         logger.info(f"Gemini solved CAPTCHA: {captcha_text}")
         return captcha_text
@@ -95,7 +90,6 @@ def save_to_database(records):
         conn = psycopg2.connect(DB_URL)
         cursor = conn.cursor()
 
-        # Create table if it doesn't exist
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS truck_entries (
                 consignment_number VARCHAR(100) PRIMARY KEY,
@@ -115,7 +109,6 @@ def save_to_database(records):
             )
         """)
 
-        # Upsert query: Update gate_status and last_updated_at if consignment_number exists
         insert_query = """
             INSERT INTO truck_entries (
                 consignment_number, ack_number, season, mill_name, miller_dispatch_date,
@@ -159,12 +152,10 @@ def run_scrape_cycle():
                 page.goto(LOGIN_URL)
                 page.wait_for_load_state('networkidle')
                 
-                # Check if already logged in (redirected)
                 if "Login" not in page.title():
                     login_success = True
                     break
 
-                # Get CAPTCHA bytes and solve
                 captcha_bytes = get_captcha_bytes(page)
                 captcha_text = solve_captcha_with_gemini(captcha_bytes)
                 
@@ -173,25 +164,19 @@ def run_scrape_cycle():
                     time.sleep(2)
                     continue
 
-                # Fill credentials
-                # Playwright allows fallback selectors (comma separated)
                 page.fill("input[type='text'], #Username, #txtUserName", OPMS_USERNAME) 
                 page.fill("input[type='password'], #Password, #txtPassword", OPMS_PASSWORD)
                 
-                # Fill CAPTCHA
                 captcha_input = page.query_selector("input[id*='captcha' i], input[id*='Captcha' i], #txtCaptcha")
                 if captcha_input:
                     captcha_input.fill(captcha_text)
                 
-                # Click Submit
                 submit_btn = page.query_selector("input[type='submit'], button[type='submit'], #btnLogin")
                 if submit_btn:
                     submit_btn.click()
                 
-                # Wait for potential redirect or error message
                 page.wait_for_load_state('networkidle', timeout=10000)
                 
-                # Verify successful login
                 if "Login" not in page.title() or page.url != LOGIN_URL:
                     logger.info("Login successful!")
                     login_success = True
@@ -208,7 +193,7 @@ def run_scrape_cycle():
             # 2. Navigate to Gate Entry
             logger.info("Navigating to Gate Entry page...")
             page.goto(GATE_ENTRY_URL)
-            page.wait_for_selector("table", timeout=15000)
+            page.wait_for_selector("table tbody tr", timeout=15000)
 
             all_records = []
             
@@ -217,8 +202,10 @@ def run_scrape_cycle():
                 rows = page.query_selector_all("table tbody tr")
                 for row in rows:
                     cols = [c.inner_text().strip() for c in row.query_selector_all("td")]
+                    
                     if len(cols) >= 11:
                         veh_no, waybill_no, waybill_date = parse_waybill(cols[9])
+                        
                         record = {
                             "season": cols[1],
                             "mill_name": cols[2],
@@ -235,11 +222,10 @@ def run_scrape_cycle():
                         }
                         all_records.append(record)
 
-                # Check for 'Next Page' button and click if not disabled
                 next_btn = page.query_selector("li.paginate_button.next:not(.disabled) a")
                 if next_btn:
                     next_btn.click()
-                    page.wait_for_timeout(1500)  # brief pause to allow table to reload
+                    page.wait_for_timeout(1500)
                 else:
                     break
 
