@@ -6,7 +6,7 @@ import logging
 import psycopg2
 from psycopg2.extras import execute_values
 from playwright.sync_api import sync_playwright
-import google.generativeai as genai
+from google import genai
 from PIL import Image
 
 # --- Configuration & Setup ---
@@ -24,8 +24,13 @@ LOGIN_URL = os.getenv("PORTAL_URL", "https://ppscmr.telangana.gov.in/")
 GATE_ENTRY_URL = "https://ppscmr.telangana.gov.in/Dumping/GateEntry"
 SCRAPE_INTERVAL = int(os.getenv("SCRAPE_INTERVAL_MINUTES", "15")) * 60
 
-# Configure Google Gemini
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+# Initialize the new Google GenAI Client
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+if gemini_api_key:
+    gemini_client = genai.Client(api_key=gemini_api_key)
+else:
+    logger.error("GEMINI_API_KEY environment variable is not set!")
+    gemini_client = None
 
 # --- Helper Functions ---
 def parse_waybill(waybill_raw):
@@ -64,16 +69,18 @@ def get_captcha_bytes(page):
     return None
 
 def solve_captcha_with_gemini(captcha_bytes):
-    """Solves the captured image using Google Gemini."""
-    if not captcha_bytes:
+    """Solves the captured image using Google Gemini (New SDK)."""
+    if not captcha_bytes or not gemini_client:
         return None
         
     try:
         image = Image.open(io.BytesIO(captcha_bytes))
-        model = genai.GenerativeModel('gemini-1.5-flash')
         prompt = "Return ONLY the exact characters or numbers shown in this CAPTCHA image. Do not include spaces, quotes, punctuation, or extra text."
         
-        response = model.generate_content([prompt, image])
+        response = gemini_client.models.generate_content(
+            model='gemini-1.5-flash',
+            contents=[prompt, image]
+        )
         captcha_text = response.text.strip().replace(" ", "")
         logger.info(f"Gemini solved CAPTCHA: {captcha_text}")
         return captcha_text
@@ -149,8 +156,8 @@ def run_scrape_cycle():
             login_success = False
             for attempt in range(3):
                 logger.info(f"Login attempt {attempt + 1}/3")
-                page.goto(LOGIN_URL)
-                page.wait_for_load_state('networkidle')
+                page.goto(LOGIN_URL, timeout=60000)
+                page.wait_for_load_state('networkidle', timeout=60000)
                 
                 if "Login" not in page.title():
                     login_success = True
@@ -175,7 +182,8 @@ def run_scrape_cycle():
                 if submit_btn:
                     submit_btn.click()
                 
-                page.wait_for_load_state('networkidle', timeout=10000)
+                # Wait up to 60 seconds for login processing
+                page.wait_for_load_state('networkidle', timeout=60000)
                 
                 if "Login" not in page.title() or page.url != LOGIN_URL:
                     logger.info("Login successful!")
@@ -192,8 +200,15 @@ def run_scrape_cycle():
 
             # 2. Navigate to Gate Entry
             logger.info("Navigating to Gate Entry page...")
-            page.goto(GATE_ENTRY_URL)
-            page.wait_for_selector("table tbody tr", timeout=15000)
+            page.goto(GATE_ENTRY_URL, timeout=60000)
+            
+            # Increased timeout to 60 seconds to allow DataTables to initialize
+            try:
+                page.wait_for_selector("table tbody tr", timeout=60000)
+            except Exception as e:
+                logger.error("Timeout: The portal took too long to load the gate entry table.")
+                browser.close()
+                return
 
             all_records = []
             
@@ -225,7 +240,7 @@ def run_scrape_cycle():
                 next_btn = page.query_selector("li.paginate_button.next:not(.disabled) a")
                 if next_btn:
                     next_btn.click()
-                    page.wait_for_timeout(1500)
+                    page.wait_for_timeout(2000) # Increased slight pause for slow AJAX loads
                 else:
                     break
 
