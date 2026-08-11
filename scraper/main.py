@@ -3,6 +3,7 @@ import time
 import io
 import json
 import logging
+import random
 import psycopg2
 from psycopg2.extras import execute_values
 from playwright.sync_api import sync_playwright
@@ -178,15 +179,19 @@ def run_scrape_cycle():
         logger.error("Missing SCRAPEDO_TOKEN. Proxy authentication will fail.")
         return
 
-    # MASTER RETRY LOOP: Attempts the entire process up to 3 times with fresh IPs
+    # MASTER RETRY LOOP: Attempts the entire process up to 3 times
     for master_attempt in range(1, 4):
         logger.info(f"--- Starting Scrape Cycle (Master Attempt {master_attempt}/3) ---")
         
         with sync_playwright() as p:
+            # Following Scrape.do documentation: Generate a valid integer Session ID between 0 and 1000000
+            session_id = random.randint(1, 999999)
+            logger.info(f"Locking Scrape.do Proxy IP with sessionId={session_id}")
+            
             scrape_do_proxy = {
                 "server": "http://proxy.scrape.do:8080",
                 "username": SCRAPEDO_TOKEN,
-                "password": "geoCode=in&super=true" 
+                "password": f"geoCode=in&super=true&sessionId={session_id}" 
             }
 
             browser = p.chromium.launch(
@@ -250,7 +255,7 @@ def run_scrape_cycle():
 
                 if not login_success:
                     logger.error("Failed to login. Bad proxy node. Retrying cycle...")
-                    continue # Triggers the finally block, then restarts Master loop
+                    continue # Restarts Master loop with a NEW sessionId
 
                 # 2. Navigate to Gate Entry
                 logger.info("Navigating to Gate Entry page...")
@@ -273,7 +278,7 @@ def run_scrape_cycle():
                             logger.error(f"Unknown page state: {visible_text[:300]}")
                     except:
                         pass
-                    continue # Triggers finally block, restarts Master loop with fresh IP
+                    continue # Restarts Master loop with a NEW sessionId
 
                 all_records = []
 
@@ -298,7 +303,7 @@ def run_scrape_cycle():
                 if all_records:
                     save_to_database(all_records)
                     logger.info(f"SUCCESS: Processed {len(all_records)} total records from screenshots.")
-                    return # Exits the entire function so it can sleep for 15 minutes!
+                    return # Exits the entire function so it can successfully sleep for 15 minutes!
                 else:
                     logger.warning("No records extracted. Retrying cycle...")
                     continue
@@ -308,7 +313,7 @@ def run_scrape_cycle():
             finally:
                 browser.close()
                 
-        # Small pause before fetching a new proxy IP
+        # Small pause before fetching a new proxy IP session
         time.sleep(5)
         
     logger.error("All 3 master attempts failed. Sleeping until next schedule.")
