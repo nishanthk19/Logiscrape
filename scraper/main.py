@@ -1,252 +1,263 @@
-"""
-Automated Truck Gate Entry Scraper
-Microservice script using Playwright, Google Gemini Vision API for CAPTCHA solving, and psycopg2 (PostgreSQL).
-Scrapes government portal OPMS for truck entries every 15 minutes.
-"""
-
 import os
-import sys
 import time
+import re
 import io
 import logging
-import requests
 import psycopg2
-from PIL import Image
-import google.generativeai as genai
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import execute_values
+from datetime import datetime
 from playwright.sync_api import sync_playwright
+import google.generativeai as genai
+from PIL import Image
 
-# Setup Logger
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+# --- Configuration & Setup ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
 
-# Environment variables with sensible defaults
-DB_HOST = os.getenv("DB_HOST", "postgres")
-DB_PORT = os.getenv("DB_PORT", "5432")
-DB_NAME = os.getenv("DB_NAME", "truck_gate_db")
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres_password_123")
+# Assemble Database URL from environment variables
+DB_URL = os.getenv("DATABASE_URL")
+if not DB_URL:
+    DB_URL = f"postgresql://{os.getenv('DB_USER', 'postgres')}:{os.getenv('DB_PASSWORD')}@{os.getenv('DB_HOST', 'postgres')}:{os.getenv('DB_PORT', '5432')}/{os.getenv('DB_NAME', 'truck_gate_db')}"
 
-OPMS_USERNAME = os.getenv("OPMS_USERNAME", "admin_gate")
-OPMS_PASSWORD = os.getenv("OPMS_PASSWORD", "SecretPass123!")
-PORTAL_URL = os.getenv("PORTAL_URL", "https://opms.gov.example/login")
-SCRAPE_INTERVAL_MINUTES = int(os.getenv("SCRAPE_INTERVAL_MINUTES", "15"))
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPMS_USERNAME = os.getenv("OPMS_USERNAME")
+OPMS_PASSWORD = os.getenv("OPMS_PASSWORD")
+LOGIN_URL = os.getenv("PORTAL_URL", "https://ppscmr.telangana.gov.in/")
+GATE_ENTRY_URL = "https://ppscmr.telangana.gov.in/Dumping/GateEntry"
+SCRAPE_INTERVAL = int(os.getenv("SCRAPE_INTERVAL_MINUTES", "15")) * 60
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+# Configure Google Gemini
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
+# --- Helper Functions ---
+def parse_waybill(waybill_raw):
+    """Parses format like '(AP12V7631 : 122511178095 : 07-08-2026)'"""
+    if not waybill_raw:
+        return None, None, None
+    match = re.search(r'\((.*?)\s*:\s*(.*?)\s*:\s*(.*?)\)', waybill_raw)
+    if match:
+        return match.group(1).strip(), match.group(2).strip(), match.group(3).strip()
+    return None, None, None
 
-def solve_captcha_with_gemini(captcha_bytes: bytes) -> str:
-    """Solves an image CAPTCHA for free using Gemini Vision."""
-    if not GEMINI_API_KEY:
-        logging.info("GEMINI_API_KEY not set. Using simulated CAPTCHA result ('7X9KA').")
-        return "7X9KA"
+def get_captcha_bytes(page):
+    """Waits for the CAPTCHA element and captures valid image bytes."""
+    # List of common selectors to try (case-insensitive)
+    selectors = [
+        "img[src*='Captcha' i]", 
+        "img[src*='captcha' i]", 
+        "#captchaImage", 
+        "#captcha_img",
+        "#imgCaptcha",
+        ".captcha-image"
+    ]
+    
+    for selector in selectors:
+        try:
+            # Short timeout per selector to fail fast
+            element = page.wait_for_selector(selector, state="visible", timeout=3000)
+            if element:
+                logger.info(f"CAPTCHA image found using selector: {selector}")
+                image_bytes = element.screenshot()
+                
+                # Verify bytes are not empty
+                if image_bytes and len(image_bytes) > 0:
+                    return image_bytes
+        except Exception:
+            continue
+            
+    logger.error("Could not find or capture a valid CAPTCHA image element on the page.")
+    return None
 
+def solve_captcha_with_gemini(captcha_bytes):
+    """Solves the captured image using Google Gemini."""
+    if not captcha_bytes:
+        return None
+        
     try:
-        logging.info("Sending CAPTCHA image to Gemini 1.5 Flash Vision model...")
         image = Image.open(io.BytesIO(captcha_bytes))
         model = genai.GenerativeModel('gemini-1.5-flash')
-        prompt = "Return ONLY the exact characters or numbers shown in this CAPTCHA image. Do not include spaces, quotes, punctuation, or explanations."
+        prompt = "Return ONLY the exact characters or numbers shown in this CAPTCHA image. Do not include spaces, quotes, punctuation, or extra text."
+        
         response = model.generate_content([prompt, image])
-        captcha_text = response.text.strip()
-        logging.info(f"[+] Gemini solved CAPTCHA: {captcha_text}")
+        # Clean the response to ensure no whitespace is included
+        captcha_text = response.text.strip().replace(" ", "")
+        logger.info(f"Gemini solved CAPTCHA: {captcha_text}")
         return captcha_text
     except Exception as e:
-        logging.error(f"[-] Gemini CAPTCHA solve error: {e}. Falling back to default.")
-        return "7X9KA"
+        logger.error(f"Gemini CAPTCHA solve error: {e}")
+        return None
 
+def save_to_database(records):
+    """Saves records to PostgreSQL using Upsert."""
+    if not records:
+        return
 
-def get_db_connection():
-    """Establishes and returns a connection to PostgreSQL."""
-    retries = 5
-    while retries > 0:
-        try:
-            conn = psycopg2.connect(
-                host=DB_HOST,
-                port=DB_PORT,
-                dbname=DB_NAME,
-                user=DB_USER,
-                password=DB_PASSWORD
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cursor = conn.cursor()
+
+        # Create table if it doesn't exist
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS truck_entries (
+                consignment_number VARCHAR(100) PRIMARY KEY,
+                ack_number VARCHAR(100),
+                season VARCHAR(50),
+                mill_name TEXT,
+                miller_dispatch_date VARCHAR(20),
+                class_type VARCHAR(100),
+                total_bags NUMERIC(10, 2),
+                total_quantity NUMERIC(10, 2),
+                vehicle_number VARCHAR(50),
+                waybill_number VARCHAR(100),
+                waybill_date VARCHAR(20),
+                gate_status VARCHAR(20),
+                first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-            return conn
-        except Exception as e:
-            logging.warning(f"Database connection waiting... ({e}) Retrying in 3s")
-            time.sleep(3)
-            retries -= 1
-    raise RuntimeError("Could not connect to PostgreSQL database after retries.")
+        """)
 
+        # Upsert query: Update gate_status and last_updated_at if consignment_number exists
+        insert_query = """
+            INSERT INTO truck_entries (
+                consignment_number, ack_number, season, mill_name, miller_dispatch_date,
+                class_type, total_bags, total_quantity, vehicle_number, waybill_number, waybill_date, gate_status
+            ) VALUES %s
+            ON CONFLICT (consignment_number) DO UPDATE SET 
+                gate_status = EXCLUDED.gate_status,
+                last_updated_at = CURRENT_TIMESTAMP;
+        """
 
-def init_db():
-    """Creates the truck_entries table in PostgreSQL if it does not exist."""
-    logging.info("Initializing PostgreSQL schema...")
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS truck_entries (
-                    id SERIAL PRIMARY KEY,
-                    transaction_id VARCHAR(50) UNIQUE NOT NULL,
-                    license_plate VARCHAR(20) NOT NULL,
-                    driver_name VARCHAR(100) NOT NULL,
-                    mill_destination VARCHAR(100) NOT NULL,
-                    gate_status VARCHAR(30) NOT NULL,
-                    tonnage NUMERIC(8, 2) DEFAULT 0.00,
-                    entry_timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    scraped_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS scraper_logs (
-                    id SERIAL PRIMARY KEY,
-                    status VARCHAR(20) NOT NULL,
-                    items_scraped INT DEFAULT 0,
-                    message TEXT,
-                    timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
+        values = [[
+            r['consignment_number'], r['ack_number'], r['season'], r['mill_name'], r['miller_dispatch_date'],
+            r['class_type'], r['total_bags'], r['total_quantity'], r['vehicle_number'], r['waybill_number'], 
+            r['waybill_date'], r['gate_status']
+        ] for r in records]
+
+        execute_values(cursor, insert_query, values)
         conn.commit()
-        conn.close()
-        logging.info("Database schema initialized successfully.")
+        logger.info(f"Saved {len(records)} entries to PostgreSQL.")
+        
     except Exception as e:
-        logging.warning(f"Note: Running in standalone or preview mode without live Postgres: {e}")
+        logger.error(f"Database error: {e}")
+    finally:
+        if 'cursor' in locals(): cursor.close()
+        if 'conn' in locals(): conn.close()
 
-
-def save_entries_to_db(entries):
-    """Inserts or updates scraped truck entries into PostgreSQL."""
-    if not entries:
-        logging.info("No entries to save.")
-        return 0
-
-    try:
-        conn = get_db_connection()
-        inserted_count = 0
-        with conn.cursor() as cur:
-            for item in entries:
-                cur.execute("""
-                    INSERT INTO truck_entries (
-                        transaction_id, license_plate, driver_name, mill_destination, gate_status, tonnage, entry_timestamp, scraped_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
-                    ON CONFLICT (transaction_id) DO UPDATE SET
-                        license_plate = EXCLUDED.license_plate,
-                        driver_name = EXCLUDED.driver_name,
-                        mill_destination = EXCLUDED.mill_destination,
-                        gate_status = EXCLUDED.gate_status,
-                        tonnage = EXCLUDED.tonnage,
-                        scraped_at = NOW();
-                """, (
-                    item['transaction_id'],
-                    item['license_plate'],
-                    item['driver_name'],
-                    item['mill_destination'],
-                    item['gate_status'],
-                    item.get('tonnage', 28.5),
-                    item.get('entry_timestamp', 'NOW()')
-                ))
-                inserted_count += 1
-            cur.execute("""
-                INSERT INTO scraper_logs (status, items_scraped, message)
-                VALUES (%s, %s, %s);
-            """, ("SUCCESS", inserted_count, f"Scraped and updated {inserted_count} truck records from OPMS portal using Gemini CAPTCHA solver."))
-        conn.commit()
-        conn.close()
-        logging.info(f"Saved {inserted_count} entries to PostgreSQL.")
-        return inserted_count
-    except Exception as e:
-        logging.error(f"Failed to save entries to DB: {e}")
-        return len(entries)
-
-
-def run_scraper_cycle():
-    """Executes a single Playwright scraping run against the government portal."""
-    logging.info(f"Starting portal scrape cycle for {PORTAL_URL}...")
-
+# --- Main Scraper Logic ---
+def run_scrape_cycle():
+    logger.info(f"Starting portal scrape cycle for {LOGIN_URL}...")
+    
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
         context = browser.new_context()
         page = context.new_page()
 
         try:
-            logging.info(f"Navigating to OPMS Portal: {PORTAL_URL}")
-            # Try loading portal page or handling dynamic form
-            try:
-                page.goto(PORTAL_URL, timeout=10000, wait_until="domcontentloaded")
-            except Exception:
-                logging.info("Portal navigation simulated in isolated preview mode.")
-
-            # Look for CAPTCHA element
-            captcha_element = page.query_selector("#captcha_img_id, #captcha-img, img[alt='captcha'], .captcha-image")
-            if captcha_element:
-                logging.info("CAPTCHA element located on page. Capturing screenshot...")
-                captcha_bytes = captcha_element.screenshot()
-                captcha_code = solve_captcha_with_gemini(captcha_bytes)
-            else:
-                logging.info("No captcha element detected on page, using Gemini solver pipeline simulation.")
-                captcha_code = solve_captcha_with_gemini(b"MOCK_CAPTCHA_BYTES")
-
-            # Fill in login form if elements exist
-            if page.query_selector("input[name='username'], #Username"):
-                user_input = page.query_selector("input[name='username'], #Username")
-                if user_input:
-                    user_input.fill(OPMS_USERNAME)
-                pass_input = page.query_selector("input[name='password'], #Password")
-                if pass_input:
-                    pass_input.fill(OPMS_PASSWORD)
-                captcha_input = page.query_selector("input[name='captcha'], #CaptchaInput")
-                if captcha_input:
-                    captcha_input.fill(captcha_code)
+            # 1. Handle Login with Retry Loop
+            login_success = False
+            for attempt in range(3):
+                logger.info(f"Login attempt {attempt + 1}/3")
+                page.goto(LOGIN_URL)
+                page.wait_for_load_state('networkidle')
                 
-                submit_btn = page.query_selector("button[type='submit'], #LoginButton")
+                # Check if already logged in (redirected)
+                if "Login" not in page.title():
+                    login_success = True
+                    break
+
+                # Get CAPTCHA bytes and solve
+                captcha_bytes = get_captcha_bytes(page)
+                captcha_text = solve_captcha_with_gemini(captcha_bytes)
+                
+                if not captcha_text:
+                    logger.warning("Could not resolve CAPTCHA. Retrying...")
+                    time.sleep(2)
+                    continue
+
+                # Fill credentials
+                # Playwright allows fallback selectors (comma separated)
+                page.fill("input[type='text'], #Username, #txtUserName", OPMS_USERNAME) 
+                page.fill("input[type='password'], #Password, #txtPassword", OPMS_PASSWORD)
+                
+                # Fill CAPTCHA
+                captcha_input = page.query_selector("input[id*='captcha' i], input[id*='Captcha' i], #txtCaptcha")
+                if captcha_input:
+                    captcha_input.fill(captcha_text)
+                
+                # Click Submit
+                submit_btn = page.query_selector("input[type='submit'], button[type='submit'], #btnLogin")
                 if submit_btn:
                     submit_btn.click()
+                
+                # Wait for potential redirect or error message
+                page.wait_for_load_state('networkidle', timeout=10000)
+                
+                # Verify successful login
+                if "Login" not in page.title() or page.url != LOGIN_URL:
+                    logger.info("Login successful!")
+                    login_success = True
+                    break
+                else:
+                    logger.warning("Login failed (Invalid CAPTCHA or credentials).")
+                    time.sleep(2)
 
-            time.sleep(2)
+            if not login_success:
+                logger.error("Failed to login after 3 attempts.")
+                browser.close()
+                return
 
-            # Sample scraped batch
-            import random
-            drivers = ["Robert Miller", "Samuel Owens", "Daniel Chen", "Marcus Wright", "Laura Smith", "Kevin Vance", "Elena Rostova", "Tariq Ahmad"]
-            mills = ["Mill A - North Row", "Mill B - Silo 2", "Mill C - Storage", "Mill A - Grain Elevator"]
-            statuses = ["Approved", "Processing", "Approved", "Approved", "Pending", "Approved"]
-            plates = ["ABC-1234", "XYZ-8821", "TRK-0092", "PLC-4450", "JKT-2211", "KMT-9012", "WXX-3100", "LMN-5544"]
+            # 2. Navigate to Gate Entry
+            logger.info("Navigating to Gate Entry page...")
+            page.goto(GATE_ENTRY_URL)
+            page.wait_for_selector("table", timeout=15000)
 
-            scraped_entries = []
-            base_tx = 29405
-            for i in range(8):
-                scraped_entries.append({
-                    "transaction_id": f"G-{base_tx - i}",
-                    "license_plate": plates[i % len(plates)],
-                    "driver_name": drivers[i % len(drivers)],
-                    "mill_destination": mills[i % len(mills)],
-                    "gate_status": statuses[i % len(statuses)],
-                    "tonnage": round(random.uniform(22.0, 44.5), 1)
-                })
+            all_records = []
+            
+            # 3. Extract Data & Handle Pagination
+            while True:
+                rows = page.query_selector_all("table tbody tr")
+                for row in rows:
+                    cols = [c.inner_text().strip() for c in row.query_selector_all("td")]
+                    if len(cols) >= 11:
+                        veh_no, waybill_no, waybill_date = parse_waybill(cols[9])
+                        record = {
+                            "season": cols[1],
+                            "mill_name": cols[2],
+                            "miller_dispatch_date": cols[3],
+                            "consignment_number": cols[4],
+                            "ack_number": cols[5],
+                            "class_type": cols[6],
+                            "total_bags": float(cols[7]) if cols[7].replace('.','',1).isdigit() else 0.0,
+                            "total_quantity": float(cols[8]) if cols[8].replace('.','',1).isdigit() else 0.0,
+                            "vehicle_number": veh_no,
+                            "waybill_number": waybill_no,
+                            "waybill_date": waybill_date,
+                            "gate_status": cols[10].replace("\n", "").strip() 
+                        }
+                        all_records.append(record)
 
-            saved_count = save_entries_to_db(scraped_entries)
-            logging.info(f"Scrape cycle finished successfully. Updated {saved_count} records.")
+                # Check for 'Next Page' button and click if not disabled
+                next_btn = page.query_selector("li.paginate_button.next:not(.disabled) a")
+                if next_btn:
+                    next_btn.click()
+                    page.wait_for_timeout(1500)  # brief pause to allow table to reload
+                else:
+                    break
+
+            # 4. Save to Database
+            if all_records:
+                save_to_database(all_records)
+                logger.info(f"Scrape cycle finished successfully. Processed {len(all_records)} records.")
+            else:
+                logger.warning("No records found in table.")
 
         except Exception as e:
-            logging.error(f"Error during Playwright scrape run: {e}")
+            logger.error(f"Error during scrape cycle: {e}")
         finally:
             browser.close()
 
-
-def main():
-    """Main loop running continuously every SCRAPE_INTERVAL_MINUTES."""
-    logging.info("Starting OPMS Gate Entry Scraper Service with Gemini Vision CAPTCHA solver...")
-    init_db()
-
-    while True:
-        try:
-            run_scraper_cycle()
-        except Exception as e:
-            logging.error(f"Unhandled exception in scraper loop: {e}")
-
-        logging.info(f"Sleeping for {SCRAPE_INTERVAL_MINUTES} minutes until next scheduled run...")
-        time.sleep(SCRAPE_INTERVAL_MINUTES * 60)
-
-
 if __name__ == "__main__":
-    main()
+    logger.info("Starting OPMS Scraper Service...")
+    while True:
+        run_scrape_cycle()
+        logger.info(f"Sleeping for {SCRAPE_INTERVAL // 60} minutes until next scheduled run...")
+        time.sleep(SCRAPE_INTERVAL)
