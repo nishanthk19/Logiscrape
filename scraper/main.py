@@ -3,7 +3,6 @@ import time
 import io
 import json
 import logging
-import random
 import psycopg2
 from psycopg2.extras import execute_values
 from playwright.sync_api import sync_playwright
@@ -175,143 +174,147 @@ def save_to_database(records):
 
 # --- Main Scraper Logic ---
 def run_scrape_cycle():
-    logger.info(f"Starting portal scrape cycle for {LOGIN_URL}...")
-    
     if not SCRAPEDO_TOKEN:
         logger.error("Missing SCRAPEDO_TOKEN. Proxy authentication will fail.")
         return
 
-    with sync_playwright() as p:
-        # Generate a random integer ID (0 to 1,000,000) to lock the residential IP address 
-        session_id = random.randint(1, 999999)
+    # MASTER RETRY LOOP: Attempts the entire process up to 3 times with fresh IPs
+    for master_attempt in range(1, 4):
+        logger.info(f"--- Starting Scrape Cycle (Master Attempt {master_attempt}/3) ---")
         
-        scrape_do_proxy = {
-            "server": "http://proxy.scrape.do:8080",
-            "username": SCRAPEDO_TOKEN,
-            # We enforce geoCode=in (India), super=true (Residential IP), render=false (Since Playwright handles JS), and lock the sessionId
-            "password": f"geoCode=in&super=true&render=false&sessionId={session_id}"
-        }
-
-        browser = p.chromium.launch(
-            headless=True, 
-            proxy=scrape_do_proxy,
-            args=[
-                '--no-sandbox', 
-                '--disable-setuid-sandbox', 
-                '--disable-blink-features=AutomationControlled',
-                '--ignore-certificate-errors'
-            ]
-        )
-        
-        context = browser.new_context(
-            ignore_https_errors=True,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={'width': 1920, 'height': 1080},
-            extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9",
-                "Upgrade-Insecure-Requests": "1"
+        with sync_playwright() as p:
+            scrape_do_proxy = {
+                "server": "http://proxy.scrape.do:8080",
+                "username": SCRAPEDO_TOKEN,
+                "password": "geoCode=in&super=true" 
             }
-        )
-        page = context.new_page()
 
-        try:
-            # 1. Login
-            login_success = False
-            for attempt in range(3):
-                logger.info(f"Login attempt {attempt + 1}/3")
-                page.goto(LOGIN_URL, timeout=60000)
-                page.wait_for_load_state('networkidle', timeout=60000)
-                
-                if "Login" not in page.title():
-                    login_success = True
-                    break
+            browser = p.chromium.launch(
+                headless=True, 
+                proxy=scrape_do_proxy,
+                args=[
+                    '--no-sandbox', 
+                    '--disable-setuid-sandbox', 
+                    '--disable-blink-features=AutomationControlled',
+                    '--ignore-certificate-errors'
+                ]
+            )
+            
+            context = browser.new_context(
+                ignore_https_errors=True,
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                viewport={'width': 1920, 'height': 1080},
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Upgrade-Insecure-Requests": "1"
+                }
+            )
+            page = context.new_page()
 
-                captcha_bytes = get_captcha_bytes(page)
-                captcha_text = solve_captcha_with_gemini(captcha_bytes)
+            try:
+                # 1. Login
+                login_success = False
+                for attempt in range(3):
+                    logger.info(f"Login attempt {attempt + 1}/3")
+                    page.goto(LOGIN_URL, timeout=60000)
+                    page.wait_for_load_state('networkidle', timeout=60000)
+                    
+                    if "Login" not in page.title():
+                        login_success = True
+                        break
+
+                    captcha_bytes = get_captcha_bytes(page)
+                    captcha_text = solve_captcha_with_gemini(captcha_bytes)
+                    
+                    if not captcha_text:
+                        time.sleep(2)
+                        continue
+
+                    page.fill("input[type='text'], #Username", OPMS_USERNAME) 
+                    page.fill("input[type='password'], #Password", OPMS_PASSWORD)
+                    
+                    captcha_input = page.query_selector("input[id*='captcha' i]")
+                    if captcha_input: 
+                        captcha_input.fill(captcha_text)
+                    
+                    submit_btn = page.query_selector("button[type='submit'], #btnLogin")
+                    if submit_btn: 
+                        submit_btn.click()
+                    
+                    page.wait_for_load_state('networkidle', timeout=60000)
+                    
+                    if "Login" not in page.title() or page.url != LOGIN_URL:
+                        logger.info("Login successful!")
+                        login_success = True
+                        break
+
+                if not login_success:
+                    logger.error("Failed to login. Bad proxy node. Retrying cycle...")
+                    continue # Triggers the finally block, then restarts Master loop
+
+                # 2. Navigate to Gate Entry
+                logger.info("Navigating to Gate Entry page...")
+                page.goto(GATE_ENTRY_URL, timeout=90000)
                 
-                if not captcha_text:
-                    time.sleep(2)
+                table_selector = "table"
+                row_selector = "table tbody tr"
+                
+                try:
+                    page.wait_for_load_state('networkidle', timeout=30000)
+                    page.wait_for_selector(row_selector, state="attached", timeout=45000)
+                    page.wait_for_timeout(2000) 
+                except Exception as e:
+                    logger.error("Timeout waiting for table rows.")
+                    try:
+                        visible_text = page.locator("body").inner_text()
+                        if "502" in visible_text or "scrape.do" in visible_text.lower():
+                            logger.error("Detected Scrape.do 502 Bad Node Error. Forcing fresh IP restart...")
+                        else:
+                            logger.error(f"Unknown page state: {visible_text[:300]}")
+                    except:
+                        pass
+                    continue # Triggers finally block, restarts Master loop with fresh IP
+
+                all_records = []
+
+                # 3. Handle Table Screenshots & Pagination
+                while True:
+                    table_element = page.locator(table_selector).first
+                    screenshot_bytes = table_element.screenshot()
+
+                    records = extract_table_data_via_gemini(screenshot_bytes)
+                    if records:
+                        all_records.extend(records)
+
+                    next_btn = page.query_selector("li.paginate_button.next:not(.disabled) a")
+                    if next_btn:
+                        logger.info("Clicking Next page...")
+                        next_btn.click()
+                        page.wait_for_timeout(3000)
+                    else:
+                        break
+
+                # 4. Save Extracted Data to PostgreSQL
+                if all_records:
+                    save_to_database(all_records)
+                    logger.info(f"SUCCESS: Processed {len(all_records)} total records from screenshots.")
+                    return # Exits the entire function so it can sleep for 15 minutes!
+                else:
+                    logger.warning("No records extracted. Retrying cycle...")
                     continue
 
-                page.fill("input[type='text'], #Username", OPMS_USERNAME) 
-                page.fill("input[type='password'], #Password", OPMS_PASSWORD)
-                
-                captcha_input = page.query_selector("input[id*='captcha' i]")
-                if captcha_input: 
-                    captcha_input.fill(captcha_text)
-                
-                submit_btn = page.query_selector("button[type='submit'], #btnLogin")
-                if submit_btn: 
-                    submit_btn.click()
-                
-                page.wait_for_load_state('networkidle', timeout=60000)
-                
-                if "Login" not in page.title() or page.url != LOGIN_URL:
-                    logger.info("Login successful!")
-                    login_success = True
-                    break
-
-            if not login_success:
-                logger.error("Failed to login after 3 attempts.")
-                browser.close()
-                return
-
-            # 2. Navigate to Gate Entry
-            logger.info("Navigating to Gate Entry page...")
-            page.goto(GATE_ENTRY_URL, timeout=90000)
-            
-            table_selector = "table"
-            row_selector = "table tbody tr"
-            
-            try:
-                page.wait_for_load_state('networkidle', timeout=30000)
-                page.wait_for_selector(row_selector, state="attached", timeout=45000)
-                page.wait_for_timeout(2000) 
             except Exception as e:
-                logger.error("Timeout: Could not find table rows.")
-                logger.error(f"DEBUG URL: {page.url}")
-                logger.error(f"DEBUG TITLE: {page.title()}")
-                try:
-                    visible_text = page.locator("body").inner_text()
-                    logger.error(f"DEBUG SCREEN TEXT:\n{visible_text[:800]}")
-                except:
-                    pass
+                logger.error(f"Unexpected error during cycle: {e}")
+            finally:
                 browser.close()
-                return
-
-            all_records = []
-
-            # 3. Handle Table Screenshots & Pagination
-            while True:
-                table_element = page.locator(table_selector).first
-                screenshot_bytes = table_element.screenshot()
-
-                records = extract_table_data_via_gemini(screenshot_bytes)
-                if records:
-                    all_records.extend(records)
-
-                next_btn = page.query_selector("li.paginate_button.next:not(.disabled) a")
-                if next_btn:
-                    logger.info("Clicking Next page...")
-                    next_btn.click()
-                    page.wait_for_timeout(3000)
-                else:
-                    break
-
-            # 4. Save Extracted Data to PostgreSQL
-            if all_records:
-                save_to_database(all_records)
-                logger.info(f"Scrape cycle finished. Processed {len(all_records)} total records from screenshots.")
-            else:
-                logger.warning("No records extracted from screenshots.")
-
-        except Exception as e:
-            logger.error(f"Error during scrape cycle: {e}")
-        finally:
-            browser.close()
+                
+        # Small pause before fetching a new proxy IP
+        time.sleep(5)
+        
+    logger.error("All 3 master attempts failed. Sleeping until next schedule.")
 
 if __name__ == "__main__":
-    logger.info("Starting OPMS Scraper Service (Screenshot + Gemini Vision Mode)...")
+    logger.info("Starting OPMS Scraper Service (Self-Healing Mode)...")
     while True:
         run_scrape_cycle()
         logger.info(f"Sleeping for {SCRAPE_INTERVAL // 60} minutes until next scheduled run...")
