@@ -1,7 +1,7 @@
 import os
 import time
+import re
 import io
-import json
 import logging
 import psycopg2
 from psycopg2.extras import execute_values
@@ -22,6 +22,7 @@ OPMS_PASSWORD = os.getenv("OPMS_PASSWORD")
 LOGIN_URL = os.getenv("PORTAL_URL", "https://ppscmr.telangana.gov.in/")
 GATE_ENTRY_URL = "https://ppscmr.telangana.gov.in/Dumping/GateEntry"
 SCRAPE_INTERVAL = int(os.getenv("SCRAPE_INTERVAL_MINUTES", "15")) * 60
+SCRAPEDO_TOKEN = os.getenv("SCRAPEDO_TOKEN")
 
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 if gemini_api_key:
@@ -31,6 +32,14 @@ else:
     gemini_client = None
 
 # --- Helper Functions ---
+def parse_waybill(waybill_raw):
+    if not waybill_raw:
+        return None, None, None
+    match = re.search(r'\((.*?)\s*:\s*(.*?)\s*:\s*(.*?)\)', waybill_raw)
+    if match:
+        return match.group(1).strip(), match.group(2).strip(), match.group(3).strip()
+    return None, None, None
+
 def get_captcha_bytes(page):
     selectors = ["img[src*='Captcha' i]", "img[src*='captcha' i]", "#captchaImage", "#captcha_img", ".captcha-image"]
     for selector in selectors:
@@ -56,86 +65,37 @@ def solve_captcha_with_gemini(captcha_bytes):
         logger.error(f"Gemini CAPTCHA solve error: {e}")
         return None
 
-def extract_table_data_via_gemini(screenshot_bytes):
-    """Uses Gemini Vision to parse the table screenshot directly into JSON."""
-    if not screenshot_bytes or not gemini_client:
-        return []
-    
-    try:
-        logger.info("Sending table screenshot to Gemini for OCR extraction...")
-        image = Image.open(io.BytesIO(screenshot_bytes))
-        
-        prompt = """
-        Analyze this screenshot of a data table. Extract all the rows into a valid JSON array of objects. 
-        For the 'Way Bill Details' column, split the data into three separate keys: vehicle_number, waybill_number, and waybill_date.
-        For the 'Action' column, use the key 'gate_status' (it will be 'Gate In' or 'Gate Out').
-        Ensure the JSON strictly uses these keys: 
-        ["season", "mill_name", "miller_dispatch_date", "consignment_number", "ack_number", "class_type", "total_bags", "total_quantity", "vehicle_number", "waybill_number", "waybill_date", "gate_status"].
-        Return ONLY valid JSON. No markdown formatting, no backticks, no explanations.
-        """
-        
-        response = gemini_client.models.generate_content(model='gemini-1.5-pro', contents=[prompt, image])
-        
-        # Clean the response to parse the JSON
-        json_string = response.text.strip()
-        if json_string.startswith('```json'):
-            json_string = json_string[7:-3]
-            
-        records = json.loads(json_string)
-        return records
-    except Exception as e:
-        logger.error(f"Gemini Table Extraction error: {e}")
-        return []
-
 def save_to_database(records):
     if not records:
         return
     try:
         conn = psycopg2.connect(DB_URL)
         cursor = conn.cursor()
-
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS truck_entries (
-                consignment_number VARCHAR(100) PRIMARY KEY,
-                ack_number VARCHAR(100),
-                season VARCHAR(50),
-                mill_name TEXT,
-                miller_dispatch_date VARCHAR(20),
-                class_type VARCHAR(100),
-                total_bags NUMERIC(10, 2),
-                total_quantity NUMERIC(10, 2),
-                vehicle_number VARCHAR(50),
-                waybill_number VARCHAR(100),
-                waybill_date VARCHAR(20),
-                gate_status VARCHAR(20),
-                first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                consignment_number VARCHAR(100) PRIMARY KEY, ack_number VARCHAR(100), season VARCHAR(50),
+                mill_name TEXT, miller_dispatch_date VARCHAR(20), class_type VARCHAR(100), total_bags NUMERIC(10, 2),
+                total_quantity NUMERIC(10, 2), vehicle_number VARCHAR(50), waybill_number VARCHAR(100),
+                waybill_date VARCHAR(20), gate_status VARCHAR(20), first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-
         insert_query = """
             INSERT INTO truck_entries (
-                consignment_number, ack_number, season, mill_name, miller_dispatch_date,
-                class_type, total_bags, total_quantity, vehicle_number, waybill_number, waybill_date, gate_status
+                consignment_number, ack_number, season, mill_name, miller_dispatch_date, class_type, 
+                total_bags, total_quantity, vehicle_number, waybill_number, waybill_date, gate_status
             ) VALUES %s
             ON CONFLICT (consignment_number) DO UPDATE SET 
-                gate_status = EXCLUDED.gate_status,
-                last_updated_at = CURRENT_TIMESTAMP;
+                gate_status = EXCLUDED.gate_status, last_updated_at = CURRENT_TIMESTAMP;
         """
-        
-        # Format values for DB insertion, ensuring safe fallbacks if Gemini missed a key
         values = [[
-            r.get('consignment_number', ''), r.get('ack_number', ''), r.get('season', ''), 
-            r.get('mill_name', ''), r.get('miller_dispatch_date', ''), r.get('class_type', ''), 
-            float(r.get('total_bags', 0)), float(r.get('total_quantity', 0)), 
-            r.get('vehicle_number', ''), r.get('waybill_number', ''), r.get('waybill_date', ''), r.get('gate_status', '')
-        ] for r in records if r.get('consignment_number')]
-
-        if values:
-            execute_values(cursor, insert_query, values)
-            conn.commit()
-            logger.info(f"Saved {len(values)} entries to PostgreSQL.")
-            
+            r['consignment_number'], r['ack_number'], r['season'], r['mill_name'], r['miller_dispatch_date'],
+            r['class_type'], r['total_bags'], r['total_quantity'], r['vehicle_number'], r['waybill_number'], 
+            r['waybill_date'], r['gate_status']
+        ] for r in records]
+        execute_values(cursor, insert_query, values)
+        conn.commit()
+        logger.info(f"Saved {len(records)} entries to PostgreSQL.")
     except Exception as e:
         logger.error(f"Database error: {e}")
     finally:
@@ -146,11 +106,31 @@ def save_to_database(records):
 def run_scrape_cycle():
     logger.info(f"Starting portal scrape cycle for {LOGIN_URL}...")
     
+    if not SCRAPEDO_TOKEN:
+        logger.error("Missing SCRAPEDO_TOKEN. Proxy will fail.")
+        return
+
     with sync_playwright() as p:
-        # Standard residential fingerprinting
-        browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled'])
+        # Route through Scrape.do Indian Proxies
+        scrape_do_proxy = {
+            "server": "http://proxy.scrape.do:8080",
+            "username": SCRAPEDO_TOKEN,
+            "password": "geoCode=in&super=true"
+        }
+
+        browser = p.chromium.launch(
+            headless=True, 
+            proxy=scrape_do_proxy,
+            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
+        )
+        
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            viewport={'width': 1920, 'height': 1080},
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Upgrade-Insecure-Requests": "1"
+            }
         )
         page = context.new_page()
 
@@ -194,33 +174,52 @@ def run_scrape_cycle():
                 browser.close()
                 return
 
-            # 2. Navigate and Screenshot
+            # 2. Navigate to Gate Entry
             logger.info("Navigating to Gate Entry page...")
-            response = page.goto(GATE_ENTRY_URL, timeout=60000)
+            page.goto(GATE_ENTRY_URL, timeout=90000)
             
-            if response and response.status == 403:
-                logger.error("FATAL: 403 Forbidden. The server is blocking the IP address.")
+            row_selector = "table.opms_table tbody tr"
+            try:
+                page.wait_for_load_state('networkidle', timeout=30000)
+                page.wait_for_selector(row_selector, state="visible", timeout=60000)
+            except Exception as e:
+                logger.error(f"Timeout: Could not find the table using selector '{row_selector}'. URL: {page.url} Title: {page.title()}")
                 browser.close()
                 return
-                
-            page.wait_for_load_state('networkidle', timeout=30000)
+
+            all_records = []
             
-            # Locate the table and take a picture of it
-            table_selector = "table.opms_table"
-            page.wait_for_selector(table_selector, state="visible", timeout=30000)
-            
-            table_element = page.locator(table_selector)
-            table_screenshot_bytes = table_element.screenshot()
-            
-            # 3. Extract via Gemini Vision
-            all_records = extract_table_data_via_gemini(table_screenshot_bytes)
+            # 3. Extract Data & Handle Pagination
+            while True:
+                rows = page.query_selector_all(row_selector)
+                for row in rows:
+                    cols = [c.inner_text().strip() for c in row.query_selector_all("td")]
+                    if len(cols) >= 11:
+                        veh_no, waybill_no, waybill_date = parse_waybill(cols[9])
+                        record = {
+                            "season": cols[1], "mill_name": cols[2], "miller_dispatch_date": cols[3],
+                            "consignment_number": cols[4], "ack_number": cols[5], "class_type": cols[6],
+                            "total_bags": float(cols[7]) if cols[7].replace('.','',1).isdigit() else 0.0,
+                            "total_quantity": float(cols[8]) if cols[8].replace('.','',1).isdigit() else 0.0,
+                            "vehicle_number": veh_no, "waybill_number": waybill_no, "waybill_date": waybill_date,
+                            "gate_status": cols[10].replace("\n", "").strip() 
+                        }
+                        all_records.append(record)
+
+                next_btn = page.query_selector("li.paginate_button.next:not(.disabled) a")
+                if next_btn:
+                    next_btn.click()
+                    page.wait_for_timeout(2000)
+                    page.wait_for_selector(row_selector, state="visible", timeout=15000)
+                else:
+                    break
 
             # 4. Save to Database
             if all_records:
                 save_to_database(all_records)
-                logger.info(f"Scrape cycle finished. Processed {len(all_records)} records from screenshot.")
+                logger.info(f"Scrape cycle finished successfully. Processed {len(all_records)} records.")
             else:
-                logger.warning("No records extracted from screenshot.")
+                logger.warning("No records found in table.")
 
         except Exception as e:
             logger.error(f"Error during scrape cycle: {e}")
@@ -228,7 +227,8 @@ def run_scrape_cycle():
             browser.close()
 
 if __name__ == "__main__":
-    logger.info("Starting OPMS Scraper Service...")
+    logger.info("Starting OPMS Scraper Service with Scrape.do Proxy...")
     while True:
         run_scrape_cycle()
+        logger.info(f"Sleeping for {SCRAPE_INTERVAL // 60} minutes...")
         time.sleep(SCRAPE_INTERVAL)
