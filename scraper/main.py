@@ -251,19 +251,30 @@ def run_scrape_cycle():
                 browser.close()
                 return
 
-            # 2. Navigate to Gate Entry
+           # 2. Navigate to Gate Entry
             logger.info("Navigating to Gate Entry page...")
             page.goto(GATE_ENTRY_URL, timeout=90000)
             
-            table_selector = "table.opms_table"
-            row_selector = "table.opms_table tbody tr"
+            # Use broad, standard HTML selectors to avoid strict CSS class mismatches
+            table_selector = "table"
+            row_selector = "table tbody tr"
             
             try:
                 page.wait_for_load_state('networkidle', timeout=30000)
-                # Wait for the table rows to populate, proving the data has loaded
-                page.wait_for_selector(row_selector, state="visible", timeout=60000)
+                # Wait for any table rows to attach to the DOM (removes strict visibility checks)
+                page.wait_for_selector(row_selector, state="attached", timeout=45000)
+                # Give JavaScript 2 seconds to finish injecting the text into the rows
+                page.wait_for_timeout(2000) 
             except Exception as e:
-                logger.error(f"Timeout: Could not find table rows using '{row_selector}'.")
+                logger.error("Timeout: Could not find table rows.")
+                # --- X-RAY DEBUGGING ---
+                logger.error(f"DEBUG URL: {page.url}")
+                logger.error(f"DEBUG TITLE: {page.title()}")
+                try:
+                    visible_text = page.locator("body").inner_text()
+                    logger.error(f"DEBUG SCREEN TEXT:\n{visible_text[:800]}")
+                except:
+                    pass
                 browser.close()
                 return
 
@@ -271,8 +282,8 @@ def run_scrape_cycle():
 
             # 3. Handle Table Screenshots & Pagination
             while True:
-                # Capture screenshot of the table element now that rows are confirmed visible
-                table_element = page.locator(table_selector)
+                # Capture screenshot of the first table element found on the page
+                table_element = page.locator(table_selector).first
                 screenshot_bytes = table_element.screenshot()
 
                 # Extract visual table data using Gemini Vision API
@@ -285,8 +296,7 @@ def run_scrape_cycle():
                 if next_btn:
                     logger.info("Clicking Next page...")
                     next_btn.click()
-                    page.wait_for_timeout(2000)
-                    page.wait_for_selector(row_selector, state="visible", timeout=15000)
+                    page.wait_for_timeout(3000) # Wait for AJAX table reload
                 else:
                     break
 
