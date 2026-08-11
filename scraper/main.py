@@ -8,7 +8,7 @@ from psycopg2.extras import execute_values
 from playwright.sync_api import sync_playwright
 from google import genai
 from PIL import Image
-import uuid  # Add this at the very top of your file with the other imports
+
 # --- Configuration & Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -180,18 +180,12 @@ def run_scrape_cycle():
         logger.error("Missing SCRAPEDO_TOKEN. Proxy authentication will fail.")
         return
 
-    
-    # ... [inside run_scrape_cycle] ...
-
     with sync_playwright() as p:
-        # Generate a unique ID for this scrape cycle to keep the IP address static
-        session_id = str(uuid.uuid4())
-        
+        # Standard Proxy Mode without the session parameter to prevent 502 errors
         scrape_do_proxy = {
             "server": "http://proxy.scrape.do:8080",
             "username": SCRAPEDO_TOKEN,
-            # Adding &session= locks the IP address so the login cookie doesn't break
-            "password": f"geoCode=in&super=true&session={session_id}"
+            "password": "geoCode=in&super=true"
         }
 
         browser = p.chromium.launch(
@@ -258,7 +252,7 @@ def run_scrape_cycle():
                 browser.close()
                 return
 
-           # 2. Navigate to Gate Entry
+            # 2. Navigate to Gate Entry
             logger.info("Navigating to Gate Entry page...")
             page.goto(GATE_ENTRY_URL, timeout=90000)
             
@@ -303,7 +297,7 @@ def run_scrape_cycle():
                 if next_btn:
                     logger.info("Clicking Next page...")
                     next_btn.click()
-                    page.wait_for_timeout(3000) # Wait for AJAX table reload
+                    page.wait_for_timeout(3000)
                 else:
                     break
 
