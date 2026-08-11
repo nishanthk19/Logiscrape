@@ -33,6 +33,7 @@ else:
 
 # --- Helper Functions ---
 def parse_waybill(waybill_raw):
+    """Parses format like '(AP12V7631 : 122511178095 : 07-08-2026)'"""
     if not waybill_raw:
         return None, None, None
     match = re.search(r'\((.*?)\s*:\s*(.*?)\s*:\s*(.*?)\)', waybill_raw)
@@ -41,6 +42,7 @@ def parse_waybill(waybill_raw):
     return None, None, None
 
 def get_captcha_bytes(page):
+    """Waits for the CAPTCHA element and captures valid image bytes."""
     selectors = ["img[src*='Captcha' i]", "img[src*='captcha' i]", "#captchaImage", "#captcha_img", ".captcha-image"]
     for selector in selectors:
         try:
@@ -54,6 +56,7 @@ def get_captcha_bytes(page):
     return None
 
 def solve_captcha_with_gemini(captcha_bytes):
+    """Solves the captured image using Google Gemini."""
     if not captcha_bytes or not gemini_client:
         return None
     try:
@@ -66,6 +69,7 @@ def solve_captcha_with_gemini(captcha_bytes):
         return None
 
 def save_to_database(records):
+    """Saves records to PostgreSQL using Upsert."""
     if not records:
         return
     try:
@@ -107,11 +111,11 @@ def run_scrape_cycle():
     logger.info(f"Starting portal scrape cycle for {LOGIN_URL}...")
     
     if not SCRAPEDO_TOKEN:
-        logger.error("Missing SCRAPEDO_TOKEN. Proxy will fail.")
+        logger.error("Missing SCRAPEDO_TOKEN. Proxy authentication will fail.")
         return
 
     with sync_playwright() as p:
-        # Route through Scrape.do Indian Proxies
+        # Route through Scrape.do Indian Residential Proxies
         scrape_do_proxy = {
             "server": "http://proxy.scrape.do:8080",
             "username": SCRAPEDO_TOKEN,
@@ -121,10 +125,16 @@ def run_scrape_cycle():
         browser = p.chromium.launch(
             headless=True, 
             proxy=scrape_do_proxy,
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
+            args=[
+                '--no-sandbox', 
+                '--disable-setuid-sandbox', 
+                '--disable-blink-features=AutomationControlled',
+                '--ignore-certificate-errors'  # Ignores SSL authority errors at browser level
+            ]
         )
         
         context = browser.new_context(
+            ignore_https_errors=True,  # Ignores SSL authority errors at context level
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             viewport={'width': 1920, 'height': 1080},
             extra_http_headers={
@@ -135,7 +145,7 @@ def run_scrape_cycle():
         page = context.new_page()
 
         try:
-            # 1. Login
+            # 1. Login Logic
             login_success = False
             for attempt in range(3):
                 logger.info(f"Login attempt {attempt + 1}/3")
@@ -157,10 +167,12 @@ def run_scrape_cycle():
                 page.fill("input[type='password'], #Password", OPMS_PASSWORD)
                 
                 captcha_input = page.query_selector("input[id*='captcha' i]")
-                if captcha_input: captcha_input.fill(captcha_text)
+                if captcha_input: 
+                    captcha_input.fill(captcha_text)
                 
                 submit_btn = page.query_selector("button[type='submit'], #btnLogin")
-                if submit_btn: submit_btn.click()
+                if submit_btn: 
+                    submit_btn.click()
                 
                 page.wait_for_load_state('networkidle', timeout=60000)
                 
@@ -170,7 +182,7 @@ def run_scrape_cycle():
                     break
 
             if not login_success:
-                logger.error("Failed to login.")
+                logger.error("Failed to login after 3 attempts.")
                 browser.close()
                 return
 
@@ -230,5 +242,5 @@ if __name__ == "__main__":
     logger.info("Starting OPMS Scraper Service with Scrape.do Proxy...")
     while True:
         run_scrape_cycle()
-        logger.info(f"Sleeping for {SCRAPE_INTERVAL // 60} minutes...")
+        logger.info(f"Sleeping for {SCRAPE_INTERVAL // 60} minutes until next scheduled run...")
         time.sleep(SCRAPE_INTERVAL)
