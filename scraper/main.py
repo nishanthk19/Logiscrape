@@ -1,6 +1,5 @@
 import os
 import time
-import re
 import io
 import json
 import logging
@@ -48,7 +47,7 @@ def get_captcha_bytes(page):
     return None
 
 def solve_captcha_with_gemini(captcha_bytes):
-    """Solves the login CAPTCHA image using Gemini."""
+    """Solves the login CAPTCHA image using Google Gemini."""
     if not captcha_bytes or not gemini_client:
         return None
     try:
@@ -63,32 +62,32 @@ def solve_captcha_with_gemini(captcha_bytes):
         return None
 
 def extract_table_data_via_gemini(screenshot_bytes):
-    """Uses Gemini Vision API to convert a table screenshot directly into JSON records."""
+    """Uses Gemini Vision API to analyze table screenshot and return JSON records."""
     if not screenshot_bytes or not gemini_client:
         return []
     
     try:
-        logger.info("Sending table screenshot to Gemini Vision for structured JSON extraction...")
+        logger.info("Sending table screenshot to Gemini Vision for extraction...")
         image = Image.open(io.BytesIO(screenshot_bytes))
         
         prompt = """
-        Analyze this screenshot of the gate entry table. Extract all table rows into a valid JSON array of objects.
+        Analyze this screenshot of a data table. Extract all rows into a JSON array of objects.
         
-        For each row, extract the following fields strictly into these exact JSON keys:
-        - "season": Season string (e.g., "Rabi 25-26", "Kharif 25-26")
-        - "mill_name": Full Mill Name
-        - "miller_dispatch_date": Date string (e.g., "07-08-2026")
-        - "consignment_number": Consignment Number string
-        - "ack_number": Ack. No string
-        - "class_type": Class type string
-        - "total_bags": Numeric total bags (e.g., 580)
-        - "total_quantity": Numeric total quantity (e.g., 290)
-        - "vehicle_number": Extract vehicle registration code from Way Bill Details (e.g., "AP12V7631")
-        - "waybill_number": Extract waybill ID digits from Way Bill Details (e.g., "122511178095")
-        - "waybill_date": Extract date from Way Bill Details (e.g., "07-08-2026")
-        - "gate_status": Status button text ("Gate In" or "Gate Out")
+        For each row, populate these exact keys:
+        - "season": text (e.g. "Rabi 25-26" or "Kharif 25-26")
+        - "mill_name": text (e.g. "18625-KAMADHENU FOOD PROCESSING...")
+        - "miller_dispatch_date": text (e.g. "07-08-2026")
+        - "consignment_number": text (e.g. "18625_R-22_FCI_1085302")
+        - "ack_number": text (e.g. "R 25 - 26/1085185")
+        - "class_type": text (e.g. "PB Grade A - Non FRK")
+        - "total_bags": number (e.g. 580.00)
+        - "total_quantity": number (e.g. 290.00)
+        - "vehicle_number": extract from 'Way Bill Details' (e.g. "AP12V7631")
+        - "waybill_number": extract from 'Way Bill Details' (e.g. "122511178095")
+        - "waybill_date": extract from 'Way Bill Details' (e.g. "07-08-2026")
+        - "gate_status": text from 'Action' button ("Gate In" or "Gate Out")
 
-        Return ONLY a raw JSON array. Do not include markdown code formatting, backticks, or explanatory text.
+        Return ONLY a valid raw JSON array. Do not include markdown code block syntax (no ```json), explanations, or quotes around the array.
         """
         
         response = gemini_client.models.generate_content(
@@ -96,21 +95,22 @@ def extract_table_data_via_gemini(screenshot_bytes):
             contents=[prompt, image]
         )
         
-        raw_text = response.text.strip()
-        # Strip markdown formatting block if present
-        if raw_text.startswith("```"):
-            lines = raw_text.splitlines()
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].startswith("```"):
-                lines = lines[:-1]
-            raw_text = "\n".join(lines).strip()
-
-        records = json.loads(raw_text)
-        logger.info(f"Gemini Vision successfully extracted {len(records)} rows from screenshot.")
+        # Clean JSON formatting if model included code fencing
+        json_string = response.text.strip()
+        if json_string.startswith("```json"):
+            json_string = json_string[7:]
+        if json_string.startswith("```"):
+            json_string = json_string[3:]
+        if json_string.endswith("```"):
+            json_string = json_string[:-3]
+            
+        json_string = json_string.strip()
+        records = json.loads(json_string)
+        
+        logger.info(f"Gemini successfully extracted {len(records)} records from screenshot.")
         return records
     except Exception as e:
-        logger.error(f"Gemini Vision table extraction error: {e}")
+        logger.error(f"Gemini Table Extraction error: {e}")
         return []
 
 def save_to_database(records):
@@ -122,10 +122,19 @@ def save_to_database(records):
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS truck_entries (
-                consignment_number VARCHAR(100) PRIMARY KEY, ack_number VARCHAR(100), season VARCHAR(50),
-                mill_name TEXT, miller_dispatch_date VARCHAR(20), class_type VARCHAR(100), total_bags NUMERIC(10, 2),
-                total_quantity NUMERIC(10, 2), vehicle_number VARCHAR(50), waybill_number VARCHAR(100),
-                waybill_date VARCHAR(20), gate_status VARCHAR(20), first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                consignment_number VARCHAR(100) PRIMARY KEY, 
+                ack_number VARCHAR(100), 
+                season VARCHAR(50),
+                mill_name TEXT, 
+                miller_dispatch_date VARCHAR(20), 
+                class_type VARCHAR(100), 
+                total_bags NUMERIC(10, 2),
+                total_quantity NUMERIC(10, 2), 
+                vehicle_number VARCHAR(50), 
+                waybill_number VARCHAR(100),
+                waybill_date VARCHAR(20), 
+                gate_status VARCHAR(20), 
+                first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -137,29 +146,31 @@ def save_to_database(records):
             ON CONFLICT (consignment_number) DO UPDATE SET 
                 gate_status = EXCLUDED.gate_status, last_updated_at = CURRENT_TIMESTAMP;
         """
+        
         values = []
         for r in records:
             consignment = r.get('consignment_number')
             if consignment:
                 values.append([
-                    str(consignment),
-                    str(r.get('ack_number', '')),
-                    str(r.get('season', '')),
-                    str(r.get('mill_name', '')),
-                    str(r.get('miller_dispatch_date', '')),
-                    str(r.get('class_type', '')),
-                    float(r.get('total_bags', 0)) if str(r.get('total_bags', '')).replace('.', '', 1).isdigit() else 0.0,
-                    float(r.get('total_quantity', 0)) if str(r.get('total_quantity', '')).replace('.', '', 1).isdigit() else 0.0,
-                    str(r.get('vehicle_number', '')),
-                    str(r.get('waybill_number', '')),
-                    str(r.get('waybill_date', '')),
-                    str(r.get('gate_status', ''))
+                    consignment,
+                    r.get('ack_number', ''),
+                    r.get('season', ''),
+                    r.get('mill_name', ''),
+                    r.get('miller_dispatch_date', ''),
+                    r.get('class_type', ''),
+                    float(r.get('total_bags', 0)),
+                    float(r.get('total_quantity', 0)),
+                    r.get('vehicle_number', ''),
+                    r.get('waybill_number', ''),
+                    r.get('waybill_date', ''),
+                    r.get('gate_status', '')
                 ])
 
         if values:
             execute_values(cursor, insert_query, values)
             conn.commit()
             logger.info(f"Saved {len(values)} entries to PostgreSQL.")
+            
     except Exception as e:
         logger.error(f"Database error: {e}")
     finally:
@@ -176,6 +187,126 @@ def run_scrape_cycle():
 
     with sync_playwright() as p:
         scrape_do_proxy = {
-            "server": "[http://proxy.scrape.do:8080](http://proxy.scrape.do:8080)",
+            "server": "http://proxy.scrape.do:8080",
             "username": SCRAPEDO_TOKEN,
-            "password": "geoCode=in
+            "password": "geoCode=in&super=true"
+        }
+
+        browser = p.chromium.launch(
+            headless=True, 
+            proxy=scrape_do_proxy,
+            args=[
+                '--no-sandbox', 
+                '--disable-setuid-sandbox', 
+                '--disable-blink-features=AutomationControlled',
+                '--ignore-certificate-errors'
+            ]
+        )
+        
+        context = browser.new_context(
+            ignore_https_errors=True,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            viewport={'width': 1920, 'height': 1080},
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Upgrade-Insecure-Requests": "1"
+            }
+        )
+        page = context.new_page()
+
+        try:
+            # 1. Login
+            login_success = False
+            for attempt in range(3):
+                logger.info(f"Login attempt {attempt + 1}/3")
+                page.goto(LOGIN_URL, timeout=60000)
+                page.wait_for_load_state('networkidle', timeout=60000)
+                
+                if "Login" not in page.title():
+                    login_success = True
+                    break
+
+                captcha_bytes = get_captcha_bytes(page)
+                captcha_text = solve_captcha_with_gemini(captcha_bytes)
+                
+                if not captcha_text:
+                    time.sleep(2)
+                    continue
+
+                page.fill("input[type='text'], #Username", OPMS_USERNAME) 
+                page.fill("input[type='password'], #Password", OPMS_PASSWORD)
+                
+                captcha_input = page.query_selector("input[id*='captcha' i]")
+                if captcha_input: 
+                    captcha_input.fill(captcha_text)
+                
+                submit_btn = page.query_selector("button[type='submit'], #btnLogin")
+                if submit_btn: 
+                    submit_btn.click()
+                
+                page.wait_for_load_state('networkidle', timeout=60000)
+                
+                if "Login" not in page.title() or page.url != LOGIN_URL:
+                    logger.info("Login successful!")
+                    login_success = True
+                    break
+
+            if not login_success:
+                logger.error("Failed to login after 3 attempts.")
+                browser.close()
+                return
+
+            # 2. Navigate to Gate Entry
+            logger.info("Navigating to Gate Entry page...")
+            page.goto(GATE_ENTRY_URL, timeout=90000)
+            
+            table_selector = "table.opms_table"
+            try:
+                page.wait_for_load_state('networkidle', timeout=30000)
+                page.wait_for_selector(table_selector, state="visible", timeout=60000)
+            except Exception as e:
+                logger.error(f"Timeout: Could not find table element '{table_selector}'.")
+                browser.close()
+                return
+
+            all_records = []
+
+            # 3. Handle Table Screenshots & Pagination
+            while True:
+                # Capture screenshot of the table element
+                table_element = page.locator(table_selector)
+                screenshot_bytes = table_element.screenshot()
+
+                # Extract visual table data using Gemini Vision API
+                records = extract_table_data_via_gemini(screenshot_bytes)
+                if records:
+                    all_records.extend(records)
+
+                # Check for 'Next' button to handle multiple pages of table records
+                next_btn = page.query_selector("li.paginate_button.next:not(.disabled) a")
+                if next_btn:
+                    logger.info("Clicking Next page...")
+                    next_btn.click()
+                    page.wait_for_timeout(2000)
+                    page.wait_for_selector(table_selector, state="visible", timeout=15000)
+                else:
+                    break
+
+            # 4. Save Extracted Data to PostgreSQL
+            if all_records:
+                save_to_database(all_records)
+                logger.info(f"Scrape cycle finished. Processed {len(all_records)} total records from screenshots.")
+            else:
+                logger.warning("No records extracted from screenshots.")
+
+        except Exception as e:
+            logger.error(f"Error during scrape cycle: {e}")
+        finally:
+            browser.close()
+
+if __name__ == "__main__":
+    logger.info("Starting OPMS Scraper Service (Screenshot + Gemini Vision Mode)...")
+    while True:
+        run_scrape_cycle()
+        logger.info(f"Sleeping for {SCRAPE_INTERVAL // 60} minutes until next scheduled run...")
+        time.sleep(SCRAPE_INTERVAL)
