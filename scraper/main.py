@@ -182,7 +182,6 @@ def run_scrape_cycle():
                 if submit_btn:
                     submit_btn.click()
                 
-                # Wait up to 60 seconds for login processing
                 page.wait_for_load_state('networkidle', timeout=60000)
                 
                 if "Login" not in page.title() or page.url != LOGIN_URL:
@@ -202,11 +201,18 @@ def run_scrape_cycle():
             logger.info("Navigating to Gate Entry page...")
             page.goto(GATE_ENTRY_URL, timeout=60000)
             
-            # Increased timeout to 60 seconds to allow DataTables to initialize
+            # Use the specific opms_table class 
+            row_selector = "table.opms_table tbody tr"
+            
             try:
-                page.wait_for_selector("table tbody tr", timeout=60000)
+                page.wait_for_load_state('networkidle', timeout=30000)
+                page.wait_for_selector(row_selector, state="visible", timeout=60000)
             except Exception as e:
-                logger.error("Timeout: The portal took too long to load the gate entry table.")
+                logger.error(f"Timeout: Could not find the table using selector '{row_selector}'.")
+                
+                # Debugging fallback in case the structure changes again
+                logger.error(f"DEBUG URL: {page.url}")
+                logger.error(f"DEBUG Title: {page.title()}")
                 browser.close()
                 return
 
@@ -214,7 +220,7 @@ def run_scrape_cycle():
             
             # 3. Extract Data & Handle Pagination
             while True:
-                rows = page.query_selector_all("table tbody tr")
+                rows = page.query_selector_all(row_selector)
                 for row in rows:
                     cols = [c.inner_text().strip() for c in row.query_selector_all("td")]
                     
@@ -240,7 +246,8 @@ def run_scrape_cycle():
                 next_btn = page.query_selector("li.paginate_button.next:not(.disabled) a")
                 if next_btn:
                     next_btn.click()
-                    page.wait_for_timeout(2000) # Increased slight pause for slow AJAX loads
+                    page.wait_for_timeout(2000)
+                    page.wait_for_selector(row_selector, state="visible", timeout=15000)
                 else:
                     break
 
