@@ -33,7 +33,6 @@ else:
 
 # --- Helper Functions ---
 def get_captcha_bytes(page):
-    """Waits for the CAPTCHA element and captures valid image bytes."""
     selectors = ["img[src*='Captcha' i]", "img[src*='captcha' i]", "#captchaImage", "#captcha_img", ".captcha-image"]
     for selector in selectors:
         try:
@@ -47,7 +46,6 @@ def get_captcha_bytes(page):
     return None
 
 def solve_captcha_with_gemini(captcha_bytes):
-    """Solves the login CAPTCHA image using Google Gemini."""
     if not captcha_bytes or not gemini_client:
         return None
     try:
@@ -62,7 +60,6 @@ def solve_captcha_with_gemini(captcha_bytes):
         return None
 
 def extract_table_data_via_gemini(screenshot_bytes):
-    """Uses Gemini Vision API to analyze table screenshot and return JSON records."""
     if not screenshot_bytes or not gemini_client:
         return []
     
@@ -95,7 +92,6 @@ def extract_table_data_via_gemini(screenshot_bytes):
             contents=[prompt, image]
         )
         
-        # Clean JSON formatting if model included code fencing
         json_string = response.text.strip()
         if json_string.startswith("```json"):
             json_string = json_string[7:]
@@ -114,7 +110,6 @@ def extract_table_data_via_gemini(screenshot_bytes):
         return []
 
 def save_to_database(records):
-    """Saves records to PostgreSQL using Upsert."""
     if not records:
         return
     try:
@@ -261,11 +256,14 @@ def run_scrape_cycle():
             page.goto(GATE_ENTRY_URL, timeout=90000)
             
             table_selector = "table.opms_table"
+            row_selector = "table.opms_table tbody tr"
+            
             try:
                 page.wait_for_load_state('networkidle', timeout=30000)
-                page.wait_for_selector(table_selector, state="visible", timeout=60000)
+                # Wait for the table rows to populate, proving the data has loaded
+                page.wait_for_selector(row_selector, state="visible", timeout=60000)
             except Exception as e:
-                logger.error(f"Timeout: Could not find table element '{table_selector}'.")
+                logger.error(f"Timeout: Could not find table rows using '{row_selector}'.")
                 browser.close()
                 return
 
@@ -273,7 +271,7 @@ def run_scrape_cycle():
 
             # 3. Handle Table Screenshots & Pagination
             while True:
-                # Capture screenshot of the table element
+                # Capture screenshot of the table element now that rows are confirmed visible
                 table_element = page.locator(table_selector)
                 screenshot_bytes = table_element.screenshot()
 
@@ -288,7 +286,7 @@ def run_scrape_cycle():
                     logger.info("Clicking Next page...")
                     next_btn.click()
                     page.wait_for_timeout(2000)
-                    page.wait_for_selector(table_selector, state="visible", timeout=15000)
+                    page.wait_for_selector(row_selector, state="visible", timeout=15000)
                 else:
                     break
 
